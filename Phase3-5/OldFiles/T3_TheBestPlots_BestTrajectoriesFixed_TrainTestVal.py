@@ -1,0 +1,280 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Mar 25 14:22:48 2025
+
+@author: Hannah Cimene
+"""
+
+#pip install tensorflow_addons
+
+import pandas as pd
+import numpy as np
+import tensorflow as tf
+import matplotlib.pyplot as plt
+import datetime
+
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import SimpleRNN, LSTM, Dense, Input, Attention
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+
+
+###########################################
+
+# the dataframe is preprocessed
+# we remove the speed where it is 0 because the taxi is parked
+# we change the timestamp to value datetime
+# we remove duplicates of the ts, lat and lon because this is redundant
+# we sort the timestamps by time
+def transform_taxi_data(df):
+    """Transforms taxi data and removes specified vids."""
+    df = df[df['speed'] != 0].copy()
+    df['ts'] = pd.to_datetime(df['ts'])
+    df = df.drop_duplicates(subset=['ts', 'lat', 'lon'])
+    df = df[['vid', 'ts', 'lat', 'lon']].copy()
+    df = df.sort_values(by='ts')
+    # Remove specified vids
+    vids_to_remove = ['X102480610', 'X103580610', 'X1027116', 'X103880610', 'X1057113']
+    df = df[~df['vid'].isin(vids_to_remove)]
+    # Find the datapoint(s) you want to delete
+    points_to_remove = df[(df['vid'] == 'X108370610') & (df['lon'] > 100.3)]
+    # Remove the points
+    df = df.drop(points_to_remove.index)
+    
+    df = df.reset_index(drop=True)
+
+    return df
+
+def create_train_test_val_sets(sequences, sequence_length):
+    """Creates train, test, and validation sets from sequences."""
+
+    train_size = int(len(sequences) * 0.8)  # 80% for training
+    test_size = int(len(sequences) * 0.1)   # 10% for testing
+    val_size = len(sequences) - train_size - test_size # remaining 10% for validation.
+
+    train = sequences[:train_size]
+    test = sequences[train_size:train_size + test_size]
+    val = sequences[train_size + test_size:]
+
+    X_train, y_train = prepare_data(train, sequence_length)
+    X_test, y_test = prepare_data(test, sequence_length)
+    X_val, y_val = prepare_data(val, sequence_length)
+
+    return X_train, y_train, X_test, y_test, X_val, y_val
+
+# we create the sequence
+# the lenght is 10, so there will be 10 x points and 10 y points that will
+#be given before predicting the next point
+def create_sequences(df, sequence_length):
+    """Creates input sequences from DataFrame."""
+    sequences = []
+    for vid, group in df.groupby('vid'):
+        lats = group['lat'].tolist()
+        lons = group['lon'].tolist()
+        for i in range(len(lats) - sequence_length):
+            seq_lats = lats[i:i + sequence_length]
+            seq_lons = lons[i:i + sequence_length]
+            target_lat = lats[i + sequence_length]
+            target_lon = lons[i + sequence_length]
+            sequences.append((seq_lats, seq_lons, target_lat, target_lon))
+    return sequences
+
+# we need the data to be prepared before the training of the model
+# we first store the sequences
+# then convert the X and y to a NumPy array (correct shape for RNN/LSTM)
+def prepare_data(sequences, sequence_length):
+    """Prepares data for RNN/LSTM model."""
+    X_lat, X_lon, y_lat, y_lon = [], [], [], []
+    for seq in sequences:
+        X_lat.append(seq[0])
+        X_lon.append(seq[1])
+        y_lat.append(seq[2])
+        y_lon.append(seq[3])
+    X = np.stack((X_lat, X_lon), axis=-1)
+    y = np.stack((y_lat, y_lon), axis=-1)
+    return X, y
+
+# to build a RNN model
+# change the dense layers, activation function, optimizer or loss
+def build_simple_rnn_model(input_shape):
+    """Builds SimpleRNN model."""
+    model = Sequential()
+    model.add(SimpleRNN(50, activation='relu', input_shape=input_shape))
+    model.add(Dense(2))
+    model.compile(optimizer='adam', loss='mse')
+    return model
+
+# to build a LSTM model
+# change the dense layers, activation function, optimizer or loss
+def build_lstm_model(input_shape):
+    """Builds LSTM model."""
+    model = Sequential()
+    model.add(LSTM(50, activation='relu', input_shape=input_shape))
+    model.add(Dense(2))
+    model.compile(optimizer='adam', loss='mse')
+    return model
+
+###### still add dropout like this one: model.add(LSTM(100, activation='relu', return_sequences=True, dropout=0.2))
+
+# to build a LSTM model with attention
+def build_lstm_model_with_attention(input_shape):
+    """Builds LSTM model with attention using tf.keras.layers.Attention."""
+    inputs = Input(shape=input_shape)
+    lstm_out = LSTM(50, return_sequences=True)(inputs)
+    # Apply Attention layer
+    attention_output = Attention()([lstm_out, lstm_out]) # query and value are both lstm_out
+    # Add a Dense layer after the attention layer
+    attention_output_dense = Dense(50, activation='relu')(attention_output)
+    # Concatenate the LSTM output and attention output
+    combined_output = tf.keras.layers.Concatenate(axis=-1)([lstm_out, attention_output_dense])
+    # Add more Dense layers
+    dense1 = Dense(100, activation='relu')(combined_output)
+    dense2 = Dense(50, activation='relu')(dense1)
+    # Apply a dense layer to the combined output
+    outputs = Dense(2)(dense2)
+    # Take the last time step output.
+    outputs = tf.keras.layers.Lambda(lambda x: x[:, -1, :])(outputs)
+    model = tf.keras.Model(inputs=inputs, outputs=outputs)
+    lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
+    initial_learning_rate=0.01,
+    decay_steps=10000,
+    decay_rate=0.9)
+    optimizer = tf.keras.optimizers.Adam(clipvalue=0.5, learning_rate=lr_schedule)
+    model.compile(optimizer=optimizer, loss='mse')
+    return model
+
+
+def train_and_plot_losses(X_train, y_train, X_test, y_test, input_shape, epochs, batch_size, sequence_length):
+    """Trains RNN, LSTM, and LSTM with attention and plots their losses."""
+
+    # RNN Model
+    rnn_model = build_simple_rnn_model(input_shape)
+    rnn_history = rnn_model.fit(X_train, y_train, epochs=epochs, batch_size=batch_size, verbose=1)
+    rnn_model.save('rnn_model.keras')
+    
+    # LSTM Model
+    lstm_model = build_lstm_model(input_shape)
+    lstm_history = lstm_model.fit(X_train, y_train, epochs=epochs, batch_size=batch_size, verbose=1)
+    lstm_model.save('lstm_model.keras')
+    
+    # LSTM with Attention Model
+    lstm_attention_model = build_lstm_model_with_attention(input_shape)
+    lstm_attention_history = lstm_attention_model.fit(X_train, y_train, epochs=epochs, batch_size=batch_size, verbose=1)
+    lstm_attention_model.save('lstm_attention_model.keras')
+    
+    # Plotting Losses
+    plt.figure(figsize=(12, 6))
+    plt.plot(rnn_history.history['loss'], label='RNN Loss')
+    plt.plot(lstm_history.history['loss'], label='LSTM Loss')
+    plt.plot(lstm_attention_history.history['loss'], label='LSTM with Attention Loss')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss (MSE)')
+    plt.title('Training Losses')
+    plt.legend()
+    plt.show()
+
+    #Evaluate models.
+    evaluate_model(rnn_model, X_test, y_test, "RNN", epochs, batch_size, sequence_length)
+    evaluate_model(lstm_model, X_test, y_test, "LSTM", epochs, batch_size, sequence_length)
+    evaluate_model(lstm_attention_model, X_test, y_test, "LSTM with Attention", epochs, batch_size, sequence_length)
+
+
+def plot_and_validate_model(model, X_train, y_train, X_val, y_val, X_test, y_test, model_name):
+    """Loads, trains with validation, plots losses, and evaluates a model."""
+
+    # Train the model with validation data
+    history = model.fit(X_train, y_train, validation_data=(X_val, y_val), epochs=70, batch_size=32)
+
+    # Plot training and validation loss
+    # plt.figure(figsize=(10, 6))
+    plt.plot(history.history['loss'], label='Training Loss')
+    plt.plot(history.history['val_loss'], label='Validation Loss')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss (MSE)')
+    
+    # Get current date and time
+    now = datetime.datetime.now()
+    date_time_str = now.strftime("%Y-%m-%d %H:%M:%S")
+    
+    plt.title(f'{model_name} - Training and Validation Loss\nDate/Time: {date_time_str}')
+    plt.legend()
+    plt.show()
+
+    # Evaluate on the test set
+    test_loss = model.evaluate(X_test, y_test)
+    print(f"{model_name} Test Loss: {test_loss}")
+    
+
+def evaluate_model(model, X_test, y_test, model_name, epochs, batch_size, sequence_length):
+    """Evaluates the model and plots results, including sequence_length."""
+    y_pred = model.predict(X_test)
+    y_test_np = np.array(y_test)
+    y_pred_np = np.array(y_pred)
+
+    mae = mean_absolute_error(y_test_np, y_pred_np)
+    rmse = np.sqrt(mean_squared_error(y_test_np, y_pred_np))
+
+    print(f"{model_name} MAE: {mae}")
+    print(f"{model_name} RMSE: {rmse}")
+
+    # Plotting (example: first 100 test points)
+    plt.figure(figsize=(15, 6))
+    plt.plot(y_test_np[:100, 0], y_test_np[:100, 1], label='Actual', marker='o')
+    plt.plot(y_pred_np[:100, 0], y_pred_np[:100, 1], label='Predicted', marker='x')
+    plt.legend()
+    plt.xlabel('Longitude')
+    plt.ylabel('Latitude')
+
+    # Get current date and time
+    now = datetime.datetime.now()
+    date_time_str = now.strftime("%Y-%m-%d %H:%M:%S")
+
+    # The title you requested:
+    plt.title(f'{model_name} - Actual vs. Predicted Trajectories\nDate/Time: {date_time_str}\nEpochs: {epochs}, Batch Size: {batch_size}, Sequence Length: {sequence_length}')
+    plt.show() #show each plot individually.
+
+############################
+
+# Main execution
+url = 'https://raw.githubusercontent.com/Rathachai/DA101/refs/heads/gh-pages/data/gps-data.csv'
+df = pd.read_csv(url)
+print("Original DataFrame Info:")
+df.info()
+transformed_df = transform_taxi_data(df)
+print("\nFinal Transformed DataFrame Info:")
+transformed_df.info()
+print("\nFinal Transformed DataFrame Head:")
+print(transformed_df.head())
+
+sequence_length=20
+
+sequences = create_sequences(transformed_df, sequence_length)
+
+# creating the datasets
+X_train, y_train, X_test, y_test, X_val, y_val = create_train_test_val_sets(sequences, sequence_length)
+
+print("X_train shape:", X_train.shape)
+print("y_train shape:", y_train.shape)
+print("X_test shape:", X_test.shape)
+print("y_test shape:", y_test.shape)
+print("X_val shape:", X_val.shape)
+print("y_val shape:", y_val.shape)
+
+############################
+
+# variables for training the model
+input_shape = (sequence_length, 2)
+epochs = 10
+batch_size = 32
+
+train_and_plot_losses(X_train, y_train, X_test, y_test, input_shape, epochs, batch_size, sequence_length)
+
+############################
+
+loaded_rnn_model = tf.keras.models.load_model('rnn_model.keras')
+loaded_lstm_model  = tf.keras.models.load_model('lstm_model.keras')
+# loaded_attention_model  = tf.keras.models.load_model('lstm_attention_model.keras')
+
+plot_and_validate_model(loaded_rnn_model, X_train, y_train, X_val, y_val, X_test, y_test, "RNN Model")
+plot_and_validate_model(loaded_lstm_model, X_train, y_train, X_val, y_val, X_test, y_test, "LSTM Model")
+# plot_and_validate_model(loaded_attention_model, X_train, y_train, X_val, y_val, X_test, y_test, "LSTM with Attention Model")
+
